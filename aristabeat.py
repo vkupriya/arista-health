@@ -4,11 +4,9 @@
 Credentials and inventory come from environment variables:
   USERNAME    - login user for the switches
   PASSWORD    - login password for the switches
-  EXTRA_VARS  - JSON string holding the inventory, e.g.
-                [{"device": "leaf1", "ip": "192.168.104.97"}]
-                (a {"inventory": [...]} object is accepted too)
-Optional:
-  ENV, DC     - saved into every document to help group results
+  CVP_URL     - Arista CVP host or URL, e.g. www.cv-prod-us-central1-c.arista.io
+  CVP_TOKEN   - Arista CVP API token, sent as a Bearer token
+The inventory is pulled from CVP as [{"device": fqdn, "ip": ip_address}, ...].
 """
 
 import argparse
@@ -31,12 +29,10 @@ TOP_MEMORY_RE = re.compile(r'([\d.]+)\s+(total|free|used|buff/cache|buffers|cach
 
 class Arista:
 
-    def __init__(self, username, password, inventory, env, dc, logger=None, debug=False):
+    def __init__(self, username, password, inventory, logger=None, debug=False):
         self.username = username
         self.password = password
         self.inventory = inventory
-        self.env = env
-        self.dc = dc
         self.debug = debug
         self.logger = logger or logging.getLogger(__name__)
         self.docs = {'health': [], 'unreachable': []}
@@ -67,7 +63,7 @@ class Arista:
         for entry in self.inventory:
             device = entry['device']
             host = entry['ip']
-            doc = {'device': device, 'env': self.env, 'dc': self.dc}
+            doc = {'device': device}
             session = requests.Session()
             try:
                 response = session.post('https://{}/login'.format(host), data=json.dumps(
@@ -100,7 +96,7 @@ class Arista:
             self._warn('Logout failed for {}: {}'.format(host, error))
 
     def _mark_unreachable(self, device, reason):
-        self.docs['unreachable'].append({'device': device, 'env': self.env, 'dc': self.dc})
+        self.docs['unreachable'].append({'device': device})
         self._warn('{} unreachable: {}'.format(device, reason))
 
     def _info(self, msg):
@@ -155,21 +151,22 @@ class Arista:
         return {slot: {'state': ps['state']} for slot, ps in supplies.items()}
 
     def _env_cooling(self, session, host):
-        result = self._run_command(session, host, 'show environment cooling')
+        result = self._run_command(session, host, 'show system environment cooling')
         data = {
             'status': result['systemStatus'],
             'ambientTemperature': result['ambientTemperature'],
+            'fanStatus': result['fansStatus']
         }
         for tray in result.get('fanTraySlots', []):
             if tray['fans']:
                 data['fanTray' + tray['fans'][0]['label']] = tray['fans'][0]['actualSpeed']
         for psu in result.get('powerSupplySlots', []):
-            if psu['fans']:
+            if psu['fans'] and psu['status'] == "ok":
                 data[psu['fans'][0]['label']] = psu['fans'][0]['actualSpeed']
         return data
 
     def _env_temperature(self, session, host):
-        result = self._run_command(session, host, 'show environment temperature')
+        result = self._run_command(session, host, 'show system environment temperature')
         return {
             'status': result['systemStatus'],
             'alert_count': sum(sensor['alertCount'] for sensor in result.get('tempSensors', [])),
@@ -282,19 +279,25 @@ class Arista:
         return {vr['interface']: vr['protocolStatus'] for vr in routers}
 
 
-def load_inventory(raw):
+def get_cvp_inventory():
+    cvp_url = os.environ.get('CVP_URL')
+    token = os.environ.get('CVP_TOKEN')
+    if not cvp_url or not token:
+        sys.exit('ERROR: CVP_URL and CVP_TOKEN environment variables must be set.')
+    base = cvp_url if cvp_url.startswith('http') else 'https://{}'.format(cvp_url)
+    headers = dict(HEADERS, Authorization='Bearer {}'.format(token))
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as error:
-        sys.exit('ERROR: EXTRA_VARS is not valid JSON: {}'.format(error))
-    if isinstance(data, dict):
-        data = data.get('inventory')
-    if not isinstance(data, list) or not data:
-        sys.exit('ERROR: EXTRA_VARS must be a non-empty list of {"device": ..., "ip": ...} objects.')
-    for entry in data:
-        if not isinstance(entry, dict) or 'device' not in entry or 'ip' not in entry:
-            sys.exit('ERROR: Invalid inventory entry {}, expected "device" and "ip" keys.'.format(entry))
-    return data
+        response = requests.get(base.rstrip('/') + '/cvpservice/inventory/devices', headers=headers,
+                                timeout=REQUEST_TIMEOUT, verify=False)
+    except requests.RequestException as error:
+        sys.exit('ERROR: Unable to reach CVP: {}'.format(error))
+    if response.status_code != 200:
+        sys.exit('ERROR: CVP inventory request failed, HTTP {}'.format(response.status_code))
+    inventory = [{'device': device['fqdn'], 'ip': device['ipAddress']}
+                 for device in response.json() if device.get('fqdn') and device.get('ipAddress')]
+    if not inventory:
+        sys.exit('ERROR: No devices with fqdn and ipAddress found in CVP.')
+    return inventory
 
 
 def get_credentials():
@@ -323,10 +326,9 @@ def parse_args():
 def main():
     args = parse_args()
     username, password = get_credentials()
-    inventory = load_inventory(os.environ.get('EXTRA_VARS', ''))
+    inventory = get_cvp_inventory()
     logger = setup_logging(args.debug)
-    beat = Arista(username, password, inventory, os.environ.get('ENV'), os.environ.get('DC'),
-                  logger=logger, debug=args.debug)
+    beat = Arista(username, password, inventory, logger=logger, debug=args.debug)
     beat.collect_data()
     print("^JSON\n")
     print(json.dumps(beat.docs, indent=2))
